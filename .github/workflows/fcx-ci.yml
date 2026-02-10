@@ -1,0 +1,92 @@
+name: GitHub CI
+
+on:
+  push:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: 'bash -Eeuo pipefail -x {0}'
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  generate-jobs:
+    name: Generate Jobs
+    runs-on: ubuntu-latest
+    outputs:
+      strategy: ${{ steps.generate-jobs.outputs.strategy }}
+    steps:
+      - uses: actions/checkout@v4
+      # Can't use this third-party action so workaround that by doing equivalent setup manually
+      #- uses: docker-library/bashbrew@HEAD
+      - name: Checkout bashbrew
+        uses: actions/checkout@v4
+        with:
+          repository: docker-library/bashbrew
+          path: bashbrew
+      - name: Install bashbrew
+        run: |
+          # GOBIN is undefined, so use GOPATH
+          export PATH=$PATH:$(go env GOPATH)/bin
+          go install github.com/docker-library/bashbrew/cmd/bashbrew@v0.1.13
+          bashbrew --version
+      - id: generate-jobs
+        name: Generate Jobs
+        run: |
+          # GOBIN is undefined, so use GOPATH
+          export PATH=$PATH:$(go env GOPATH)/bin
+          export BASHBREW_SCRIPTS=${{ github.workspace }}/bashbrew/scripts
+
+          strategy="$("$BASHBREW_SCRIPTS/github-actions/generate.sh")"
+
+          EOF="EOF-$RANDOM-$RANDOM-$RANDOM"
+          echo "strategy<<$EOF" >> "$GITHUB_OUTPUT"
+          jq <<<"$strategy" . | tee -a "$GITHUB_OUTPUT"
+          echo "$EOF" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: generate-jobs
+    strategy: ${{ fromJson(needs.generate-jobs.outputs.strategy) }}
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare Environment
+        run: ${{ matrix.runs.prepare }}
+      - name: Pull Dependencies
+        run: ${{ matrix.runs.pull }}
+      - name: Build ${{ matrix.name }}
+        run: ${{ matrix.runs.build }}
+      - name: History ${{ matrix.name }}
+        run: ${{ matrix.runs.history }}
+      - name: Test ${{ matrix.name }}
+        run: ${{ matrix.runs.test }}
+      - name: '"docker images"'
+        run: ${{ matrix.runs.images }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          aws-region: eu-central-1
+          aws-access-key-id: ${{ secrets.ECR_ALCHEMY_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.ECR_ALCHEMY_SECRET_ACCESS_KEY }}
+      - name: Log in to AWS ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+      - name: Tag and push docker image to Amazon ECR
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: golang
+        run: |
+          # Push docker-golang images into ECR registry as golang (preserve tags)
+          tags=$(docker images docker-golang --format "{{ .Tag }}")
+          while read -r tag; do
+            docker image tag "docker-golang:${tag}" "${REGISTRY}/${REPOSITORY}:${tag}"
+          done <<< "$tags"
+          docker image push --all-tags ${REGISTRY}/${REPOSITORY}
